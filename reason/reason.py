@@ -357,7 +357,15 @@ class Reason(commands.Cog):
     async def reason(self, ctx):
         """Get a random reason."""
         # If invoked without subcommand (text) or via fallback (slash)
-        await self.send_reason(ctx)
+        # make the instant drop admin-only, but keep subcommands public.
+        if ctx.invoked_subcommand is None:
+            allowed = await checks.admin_or_permissions(manage_guild=True).predicate(ctx)
+            if not allowed:
+                return await ctx.send(
+                    "Admins only: use an admin to run this instant drop.",
+                    ephemeral=getattr(ctx, "interaction", None) is not None,
+                )
+            await self.send_reason(ctx)
 
     async def send_reason(self, ctx):
         reason_text = random.choice(self.reasons)
