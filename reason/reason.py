@@ -3,7 +3,7 @@ import json
 import random
 from pathlib import Path
 from discord.ext import tasks
-from redbot.core import commands, Config, app_commands
+from redbot.core import commands, Config, app_commands, checks
 
 class ReasonView(discord.ui.View):
     def __init__(self, cog):
@@ -114,7 +114,8 @@ class Reason(commands.Cog):
 
     @reason.command(name="channel")
     @app_commands.describe(channel="The channel for random drops")
-    @commands.guild_owner_or_permissions(administrator=True)
+    @checks.admin_or_permissions(manage_guild=True)
+    @commands.guild_only()
     async def set_channel(self, ctx, channel: discord.TextChannel):
         """Set the channel where the embeds will be dropped."""
         await self.config.guild(ctx.guild).channel_id.set(channel.id)
