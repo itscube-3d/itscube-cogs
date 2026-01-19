@@ -207,3 +207,6 @@ marimo/_lsp/
 __marimo__/
 
 .DS_Store
+
+# Local tooling / generators (not part of the cogs)
+icons-gen/
