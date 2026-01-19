@@ -14,19 +14,19 @@ class ReasonView(discord.ui.View):
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # If a target is set, only that user can click the buttons.
         if self.target_user_id is not None and interaction.user and interaction.user.id != self.target_user_id:
-            await interaction.response.send_message("These buttons are only for the selected user.", ephemeral=True)
+            await interaction.response.send_message("Not your loot drop 🙂", ephemeral=True)
             return False
         return True
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="reason_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("You accepted the reason!", ephemeral=True)
+        await interaction.response.send_message("Locked in (for laughs).", ephemeral=True)
 
     @discord.ui.button(label="Reject", style=discord.ButtonStyle.danger, custom_id="reason_reject")
     async def reject(self, interaction: discord.Interaction, button: discord.ui.Button):
-        await interaction.response.send_message("You rejected the reason!", ephemeral=True)
+        await interaction.response.send_message("Nope. Rerolled in my head.", ephemeral=True)
 
-    @discord.ui.button(label="Stop showing me this", style=discord.ButtonStyle.secondary, custom_id="reason_stop")
+    @discord.ui.button(label="Opt out", style=discord.ButtonStyle.secondary, custom_id="reason_stop")
     async def stop_showing(self, interaction: discord.Interaction, button: discord.ui.Button):
         if interaction.guild is None:
             await interaction.response.send_message("This button only works inside a server.", ephemeral=True)
@@ -54,6 +54,7 @@ class Reason(commands.Cog):
             "test_channel_id": None,
         }
         self.config.register_guild(**default_guild)
+        self.config.register_member(seen_intro=False)
         
         reasons_path = Path(__file__).parent / "reasons.json"
         try:
@@ -66,27 +67,29 @@ class Reason(commands.Cog):
         self.reason_loop.start()
         self.reason_test_loop.start()
 
-    def _build_reason_embed(self, *, member: discord.abc.User, reason_text: str, title: str = "Reason") -> discord.Embed:
-        embed = discord.Embed(
-            title=title,
-            description="Use the buttons below to respond.",
-            color=discord.Color.random(),
+    async def _intro_field_text_for(self, member: discord.Member) -> str:
+        seen_intro = await self.config.member(member).seen_intro()
+        if not seen_intro:
+            return (
+                "A tiny party-game that drops random ‘reasons’ for laughs.\n"
+                "Fictional lines only — not advice, not a rulebook, not a lifestyle."
+            )
+        return "For when you need a NO with style — in-game."
+
+    async def _build_reason_embed(self, *, member: discord.Member, reason_text: str, title: str = "Reason") -> discord.Embed:
+        # Keep the embed minimal; Discord doesn't let us increase embed font size,
+        # so the "big" text lives in the message content.
+        embed = discord.Embed(color=discord.Color.random())
+        embed.add_field(name="About", value=await self._intro_field_text_for(member), inline=False)
+        embed.set_footer(
+            text="Your choice is private. Use /reason help to learn what this cog does and how to configure drops."
         )
-        embed.add_field(
-            name="Tip",
-            value=(
-                "Your choice is private. "
-                "Use `/reason help` to learn what this cog does and how to configure drops."
-            ),
-            inline=False,
-        )
-        embed.set_footer(text=f"Selected for: {member.display_name} | Your choice is private")
         return embed
 
     def _build_reason_message_content(self, *, member: discord.abc.User, reason_text: str) -> str:
         # Regular message content renders larger than embed descriptions.
         # Keep within Discord's 2000 character limit.
-        prefix = f"Hey {member.mention}, here is a reason for you!\n\n>>> **"
+        prefix = f"Hey {member.mention}, here is a reason for you:\n**"
         suffix = "**"
         max_reason_len = 2000 - len(prefix) - len(suffix)
         if max_reason_len < 0:
@@ -128,12 +131,13 @@ class Reason(commands.Cog):
 
         member = random.choice(members)
         reason_text = random.choice(self.reasons)
-        embed = self._build_reason_embed(member=member, reason_text=reason_text, title=title)
+        embed = await self._build_reason_embed(member=member, reason_text=reason_text, title=title)
         view = ReasonView(self, target_user_id=member.id)
         message_content = self._build_reason_message_content(member=member, reason_text=reason_text)
 
         try:
             await channel.send(content=message_content, embed=embed, view=view)  # type: ignore[attr-defined]
+            await self.config.member(member).seen_intro.set(True)
         except discord.Forbidden:
             pass
         except Exception as e:
@@ -181,10 +185,11 @@ class Reason(commands.Cog):
 
     async def send_reason(self, ctx):
         reason_text = random.choice(self.reasons)
-        embed = self._build_reason_embed(member=ctx.author, reason_text=reason_text, title="Reason")
+        embed = await self._build_reason_embed(member=ctx.author, reason_text=reason_text, title="Reason")
         view = ReasonView(self, target_user_id=ctx.author.id)
         content = self._build_reason_message_content(member=ctx.author, reason_text=reason_text)
         await ctx.send(content=content, embed=embed, view=view)
+        await self.config.member(ctx.author).seen_intro.set(True)
 
     @reason.command(name="channel")
     @app_commands.describe(channel="The channel for random drops")
