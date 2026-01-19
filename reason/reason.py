@@ -6,9 +6,17 @@ from discord.ext import tasks
 from redbot.core import commands, Config, app_commands, checks
 
 class ReasonView(discord.ui.View):
-    def __init__(self, cog):
+    def __init__(self, cog, *, target_user_id: int | None = None):
         super().__init__(timeout=None)
         self.cog = cog
+        self.target_user_id = target_user_id
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # If a target is set, only that user can click the buttons.
+        if self.target_user_id is not None and interaction.user and interaction.user.id != self.target_user_id:
+            await interaction.response.send_message("These buttons are only for the selected user.", ephemeral=True)
+            return False
+        return True
 
     @discord.ui.button(label="Accept", style=discord.ButtonStyle.success, custom_id="reason_accept")
     async def accept(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -20,6 +28,9 @@ class ReasonView(discord.ui.View):
 
     @discord.ui.button(label="Stop showing me this", style=discord.ButtonStyle.secondary, custom_id="reason_stop")
     async def stop_showing(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if interaction.guild is None:
+            await interaction.response.send_message("This button only works inside a server.", ephemeral=True)
+            return
         async with self.cog.config.guild(interaction.guild).opt_out_list() as opt_out:
             if interaction.user.id not in opt_out:
                 opt_out.append(interaction.user.id)
@@ -83,7 +94,7 @@ class Reason(commands.Cog):
             )
             embed.set_footer(text=f"Selected for: {member.display_name} | Your choice is private")
             
-            view = ReasonView(self)
+            view = ReasonView(self, target_user_id=member.id)
             message_content = f"Hey {member.mention}, here is a reason for you!"
             
             try:
@@ -110,7 +121,8 @@ class Reason(commands.Cog):
             description=reason_text,
             color=discord.Color.random()
         )
-        await ctx.send(embed=embed)
+        view = ReasonView(self, target_user_id=ctx.author.id)
+        await ctx.send(content=f"Hey {ctx.author.mention}, here is a reason for you!", embed=embed, view=view)
 
     @reason.command(name="channel")
     @app_commands.describe(channel="The channel for random drops")
