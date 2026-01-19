@@ -69,7 +69,7 @@ class Reason(commands.Cog):
     def _build_reason_embed(self, *, member: discord.abc.User, reason_text: str, title: str = "Reason") -> discord.Embed:
         embed = discord.Embed(
             title=title,
-            description=reason_text,
+            description="Use the buttons below to respond.",
             color=discord.Color.random(),
         )
         embed.add_field(
@@ -82,6 +82,20 @@ class Reason(commands.Cog):
         )
         embed.set_footer(text=f"Selected for: {member.display_name} | Your choice is private")
         return embed
+
+    def _build_reason_message_content(self, *, member: discord.abc.User, reason_text: str) -> str:
+        # Regular message content renders larger than embed descriptions.
+        # Keep within Discord's 2000 character limit.
+        prefix = f"Hey {member.mention}, here is a reason for you!\n\n>>> **"
+        suffix = "**"
+        max_reason_len = 2000 - len(prefix) - len(suffix)
+        if max_reason_len < 0:
+            # Extremely defensive; should never happen.
+            return f"Hey {member.mention}, here is a reason for you!"
+        trimmed = reason_text
+        if len(trimmed) > max_reason_len:
+            trimmed = trimmed[: max(0, max_reason_len - 1)] + "…"
+        return prefix + trimmed + suffix
 
     def _eligible_members_for_channel(
         self,
@@ -116,7 +130,7 @@ class Reason(commands.Cog):
         reason_text = random.choice(self.reasons)
         embed = self._build_reason_embed(member=member, reason_text=reason_text, title=title)
         view = ReasonView(self, target_user_id=member.id)
-        message_content = f"Hey {member.mention}, here is a reason for you!"
+        message_content = self._build_reason_message_content(member=member, reason_text=reason_text)
 
         try:
             await channel.send(content=message_content, embed=embed, view=view)  # type: ignore[attr-defined]
@@ -169,7 +183,8 @@ class Reason(commands.Cog):
         reason_text = random.choice(self.reasons)
         embed = self._build_reason_embed(member=ctx.author, reason_text=reason_text, title="Reason")
         view = ReasonView(self, target_user_id=ctx.author.id)
-        await ctx.send(content=f"Hey {ctx.author.mention}, here is a reason for you!", embed=embed, view=view)
+        content = self._build_reason_message_content(member=ctx.author, reason_text=reason_text)
+        await ctx.send(content=content, embed=embed, view=view)
 
     @reason.command(name="channel")
     @app_commands.describe(channel="The channel for random drops")
