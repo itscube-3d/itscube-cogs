@@ -3,8 +3,222 @@ import json
 import random
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from discord.ext import tasks
 from redbot.core import commands, Config, app_commands, checks
+
+if TYPE_CHECKING:
+    from redbot.core.bot import Red
+
+# ---------------------------------------------------------------------------
+# Achievements definitions
+# ---------------------------------------------------------------------------
+
+ACHIEVEMENTS = [
+    {"id": "first_claim", "name": "🎉 First Claim", "desc": "Claim your first reason", "check": lambda s: s.get("total_claims", 0) >= 1},
+    {"id": "collector_10", "name": "🧺 Collector", "desc": "Claim 10 reasons", "check": lambda s: s.get("total_claims", 0) >= 10},
+    {"id": "collector_50", "name": "📦 Hoarder", "desc": "Claim 50 reasons", "check": lambda s: s.get("total_claims", 0) >= 50},
+    {"id": "streak_5", "name": "🔥 On Fire", "desc": "Reach a 5 W streak", "check": lambda s: s.get("streak", 0) >= 5},
+    {"id": "streak_10", "name": "💥 Unstoppable", "desc": "Reach a 10 W streak", "check": lambda s: s.get("streak", 0) >= 10},
+    {"id": "points_100", "name": "💯 Century", "desc": "Earn 100 points", "check": lambda s: s.get("points", 0) >= 100},
+    {"id": "points_500", "name": "🏆 High Roller", "desc": "Earn 500 points", "check": lambda s: s.get("points", 0) >= 500},
+    {"id": "thief", "name": "😈 Thief", "desc": "Successfully steal once", "check": lambda s: s.get("total_steals_success", 0) >= 1},
+    {"id": "master_thief", "name": "🦹 Master Thief", "desc": "Successfully steal 5 times", "check": lambda s: s.get("total_steals_success", 0) >= 5},
+    {"id": "critic", "name": "👍 Critic", "desc": "Rate 10 reasons as W", "check": lambda s: s.get("total_ws", 0) >= 10},
+]
+
+def get_unlocked_achievements(stats: dict) -> list[dict]:
+    return [a for a in ACHIEVEMENTS if a["check"](stats)]
+
+# ---------------------------------------------------------------------------
+# Persistent View for bot restarts
+# ---------------------------------------------------------------------------
+
+class PersistentReasonView(discord.ui.View):
+    """
+    Minimal persistent view registered on cog load.
+    Handles button clicks after bot restart by looking up state from config.
+    """
+
+    def __init__(self, cog):
+        super().__init__(timeout=None)
+        self.cog = cog
+
+    async def _get_state(self, interaction: discord.Interaction) -> dict | None:
+        if not interaction.message or not interaction.guild:
+            return None
+        msg_id = str(interaction.message.id)
+        states = await self.cog.config.guild(interaction.guild).drop_states()
+        return states.get(msg_id)
+
+    async def _save_state(self, interaction: discord.Interaction, state: dict) -> None:
+        if not interaction.message or not interaction.guild:
+            return
+        msg_id = str(interaction.message.id)
+        async with self.cog.config.guild(interaction.guild).drop_states() as states:
+            states[msg_id] = state
+            # Cleanup: keep only last 100 entries
+            if len(states) > 100:
+                sorted_keys = sorted(states.keys(), key=int)
+                for k in sorted_keys[:-100]:
+                    del states[k]
+
+    @discord.ui.button(label="Reroll 🎲", style=discord.ButtonStyle.primary, custom_id="reason_reroll", row=0)
+    async def reroll(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return await interaction.response.send_message("This drop has expired.", ephemeral=True)
+        if interaction.user.id != state.get("target_user_id"):
+            return await interaction.response.send_message("Not your loot drop 🙂", ephemeral=True)
+        if state.get("rerolls_left", 0) <= 0:
+            return await interaction.response.send_message("No rerolls left.", ephemeral=True)
+
+        state["rerolls_left"] -= 1
+        state["reason_text"] = random.choice(self.cog.reasons)
+        await self._save_state(interaction, state)
+
+        content = self.cog._build_reason_message_content(
+            member=interaction.user, reason_text=state["reason_text"]
+        )
+        await interaction.response.edit_message(content=content)
+
+    @discord.ui.button(label="Claim 🧾", style=discord.ButtonStyle.success, custom_id="reason_claim", row=0)
+    async def claim(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return await interaction.response.send_message("This drop has expired.", ephemeral=True)
+        if interaction.user.id != state.get("target_user_id"):
+            return await interaction.response.send_message("Not your loot drop 🙂", ephemeral=True)
+        if state.get("claimed"):
+            return await interaction.response.send_message("Already claimed.", ephemeral=True)
+
+        state["claimed"] = True
+        await self._save_state(interaction, state)
+
+        mconf = self.cog.config.member(interaction.user)
+        async with mconf.wallet() as wallet:
+            wallet.append({"reason": state["reason_text"], "ts": int(time.time())})
+            if len(wallet) > 500:
+                wallet[:] = wallet[-500:]
+
+        pts = await mconf.points()
+        bonus = 5
+        bonus_msg = ""
+        now = time.time()
+        last_daily = await mconf.last_daily_claim()
+        if now - last_daily >= 86400:
+            bonus += 10
+            bonus_msg = " (🎁 +10 daily bonus!)"
+            await mconf.last_daily_claim.set(now)
+
+        total_claims = await mconf.total_claims()
+        await mconf.points.set(pts + bonus)
+        await mconf.total_claims.set(total_claims + 1)
+        await interaction.response.send_message(f"🧾 Claimed! +{bonus} pts{bonus_msg}", ephemeral=True)
+
+    @discord.ui.button(label="W 👍", style=discord.ButtonStyle.success, custom_id="reason_w", row=1)
+    async def rate_w(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return await interaction.response.send_message("This drop has expired.", ephemeral=True)
+        if interaction.user.id != state.get("target_user_id"):
+            return await interaction.response.send_message("Not your loot drop 🙂", ephemeral=True)
+        if state.get("rated"):
+            return await interaction.response.send_message("Already rated.", ephemeral=True)
+
+        state["rated"] = True
+        await self._save_state(interaction, state)
+
+        mconf = self.cog.config.member(interaction.user)
+        pts = await mconf.points()
+        streak = await mconf.streak()
+        total_ws = await mconf.total_ws()
+        await mconf.points.set(pts + 10)
+        await mconf.streak.set(streak + 1)
+        await mconf.total_ws.set(total_ws + 1)
+
+        async with self.cog.config.guild(interaction.guild).best_reasons() as best:
+            found = False
+            for entry in best:
+                if entry["reason"] == state["reason_text"]:
+                    entry["votes"] += 1
+                    found = True
+                    break
+            if not found:
+                best.append({"reason": state["reason_text"], "votes": 1})
+            best.sort(key=lambda x: x["votes"], reverse=True)
+            best[:] = best[:50]
+
+        await interaction.response.send_message(f"👍 W! +10 pts | 🔥 Streak: {streak + 1}", ephemeral=True)
+
+    @discord.ui.button(label="L 👎", style=discord.ButtonStyle.danger, custom_id="reason_l", row=1)
+    async def rate_l(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return await interaction.response.send_message("This drop has expired.", ephemeral=True)
+        if interaction.user.id != state.get("target_user_id"):
+            return await interaction.response.send_message("Not your loot drop 🙂", ephemeral=True)
+        if state.get("rated"):
+            return await interaction.response.send_message("Already rated.", ephemeral=True)
+
+        state["rated"] = True
+        await self._save_state(interaction, state)
+
+        mconf = self.cog.config.member(interaction.user)
+        pts = await mconf.points()
+        await mconf.points.set(pts + 2)
+        await mconf.streak.set(0)
+        await interaction.response.send_message("👎 L. +2 pts | Streak reset.", ephemeral=True)
+
+    @discord.ui.button(label="Steal 😈", style=discord.ButtonStyle.secondary, custom_id="reason_steal", row=1)
+    async def steal(self, interaction: discord.Interaction, button: discord.ui.Button):
+        state = await self._get_state(interaction)
+        if not state:
+            return await interaction.response.send_message("This drop has expired.", ephemeral=True)
+        if not interaction.guild:
+            return await interaction.response.send_message("Server only.", ephemeral=True)
+        if interaction.user.id == state.get("target_user_id"):
+            return await interaction.response.send_message("Can't steal your own drop.", ephemeral=True)
+
+        now = time.time()
+        gconf = self.cog.config.guild(interaction.guild)
+        guild_last_steal = await gconf.guild_last_steal()
+        if now - guild_last_steal < 120:
+            return await interaction.response.send_message(f"Server cooldown. {int(120-(now-guild_last_steal))}s left.", ephemeral=True)
+
+        mconf = self.cog.config.member(interaction.user)
+        last_steal = await mconf.last_steal()
+        if now - last_steal < 300:
+            return await interaction.response.send_message(f"Your cooldown. {int(300-(now-last_steal))}s left.", ephemeral=True)
+
+        await mconf.last_steal.set(now)
+        await gconf.guild_last_steal.set(now)
+
+        if random.random() < 0.20:
+            stolen = random.randint(5, 15)
+            target = interaction.guild.get_member(state["target_user_id"])
+            if target:
+                tpts = await self.cog.config.member(target).points()
+                stolen = min(stolen, tpts)
+                await self.cog.config.member(target).points.set(tpts - stolen)
+            pts = await mconf.points()
+            total_steals = await mconf.total_steals_success()
+            await mconf.points.set(pts + stolen)
+            await mconf.total_steals_success.set(total_steals + 1)
+            await interaction.response.send_message(f"😈 Stole {stolen} pts!", ephemeral=True)
+        else:
+            await interaction.response.send_message("😅 Steal failed.", ephemeral=True)
+
+    @discord.ui.button(label="Mute 🔕", style=discord.ButtonStyle.secondary, custom_id="reason_mute", row=2)
+    async def mute_drops(self, interaction: discord.Interaction, button: discord.ui.Button):
+        if not interaction.guild:
+            return await interaction.response.send_message("Server only.", ephemeral=True)
+        async with self.cog.config.guild(interaction.guild).opt_out_list() as opt_out:
+            if interaction.user.id not in opt_out:
+                opt_out.append(interaction.user.id)
+                await interaction.response.send_message("🔕 Muted.", ephemeral=True)
+            else:
+                await interaction.response.send_message("Already muted.", ephemeral=True)
 
 # ---------------------------------------------------------------------------
 # Game View with mini-game mechanics
@@ -28,7 +242,8 @@ class ReasonGameView(discord.ui.View):
         reason_text: str,
         all_reasons: list[str],
     ):
-        super().__init__(timeout=None)
+        # 12-hour timeout for interactive buttons
+        super().__init__(timeout=43200)
         self.cog = cog
         self.target_user_id = target_user_id
         self.reason_text = reason_text
@@ -36,6 +251,20 @@ class ReasonGameView(discord.ui.View):
         self.rerolls_left = 2
         self.claimed = False
         self.rated = False
+        self.message: discord.Message | None = None  # set after send
+
+    async def on_timeout(self) -> None:
+        """Disable Reroll, Claim, Steal after 12 hours."""
+        for child in self.children:
+            if isinstance(child, discord.ui.Button) and child.custom_id in (
+                "reason_reroll", "reason_claim", "reason_steal"
+            ):
+                child.disabled = True
+        if self.message:
+            try:
+                await self.message.edit(view=self)
+            except discord.HTTPException:
+                pass
 
     # ---- helpers ----
 
@@ -76,15 +305,32 @@ class ReasonGameView(discord.ui.View):
         button.disabled = True
 
         member = interaction.user
-        async with self.cog.config.member(member).wallet() as wallet:
+        mconf = self.cog.config.member(member)
+        async with mconf.wallet() as wallet:
             wallet.append({"reason": self.reason_text, "ts": int(time.time())})
             # Cap wallet size
             if len(wallet) > 500:
                 wallet[:] = wallet[-500:]
-        pts = await self.cog.config.member(member).points()
-        await self.cog.config.member(member).points.set(pts + 5)
 
-        await interaction.response.send_message(f"🧾 Claimed! +5 pts (total: {pts + 5})", ephemeral=True)
+        pts = await mconf.points()
+        bonus = 5
+        bonus_msg = ""
+
+        # Daily bonus: +10 extra if first claim in 24hrs
+        now = time.time()
+        last_daily = await mconf.last_daily_claim()
+        if now - last_daily >= 86400:  # 24 hours
+            bonus += 10
+            bonus_msg = " (🎁 +10 daily bonus!)"
+            await mconf.last_daily_claim.set(now)
+
+        total_claims = await mconf.total_claims()
+        await mconf.points.set(pts + bonus)
+        await mconf.total_claims.set(total_claims + 1)
+
+        await interaction.response.send_message(
+            f"🧾 Claimed! +{bonus} pts (total: {pts + bonus}){bonus_msg}", ephemeral=True
+        )
         await self._update_message(interaction)
 
     @discord.ui.button(label="W 👍", style=discord.ButtonStyle.success, custom_id="reason_w", row=1)
@@ -102,10 +348,13 @@ class ReasonGameView(discord.ui.View):
                 child.disabled = True
 
         member = interaction.user
-        pts = await self.cog.config.member(member).points()
-        streak = await self.cog.config.member(member).streak()
-        await self.cog.config.member(member).points.set(pts + 10)
-        await self.cog.config.member(member).streak.set(streak + 1)
+        mconf = self.cog.config.member(member)
+        pts = await mconf.points()
+        streak = await mconf.streak()
+        total_ws = await mconf.total_ws()
+        await mconf.points.set(pts + 10)
+        await mconf.streak.set(streak + 1)
+        await mconf.total_ws.set(total_ws + 1)
 
         # Update server best reasons
         async with self.cog.config.guild(interaction.guild).best_reasons() as best:
@@ -158,16 +407,28 @@ class ReasonGameView(discord.ui.View):
         if interaction.user.id == self.target_user_id:
             return await interaction.response.send_message("Can't steal your own drop.", ephemeral=True)
 
-        # Cooldown check (5 minutes)
-        last_steal = await self.cog.config.member(interaction.user).last_steal()
         now = time.time()
+
+        # Anti-spam: guild-wide cooldown (2 minutes)
+        gconf = self.cog.config.guild(interaction.guild)
+        guild_last_steal = await gconf.guild_last_steal()
+        if now - guild_last_steal < 120:
+            remaining = int(120 - (now - guild_last_steal))
+            return await interaction.response.send_message(
+                f"Server steal cooldown. Try again in {remaining}s.", ephemeral=True
+            )
+
+        # Per-user cooldown (5 minutes)
+        mconf = self.cog.config.member(interaction.user)
+        last_steal = await mconf.last_steal()
         if now - last_steal < 300:
             remaining = int(300 - (now - last_steal))
             return await interaction.response.send_message(
-                f"Steal on cooldown. Try again in {remaining}s.", ephemeral=True
+                f"Your steal cooldown. Try again in {remaining}s.", ephemeral=True
             )
 
-        await self.cog.config.member(interaction.user).last_steal.set(now)
+        await mconf.last_steal.set(now)
+        await gconf.guild_last_steal.set(now)
 
         # 20% success chance
         if random.random() < 0.20:
@@ -179,8 +440,11 @@ class ReasonGameView(discord.ui.View):
                 stolen = min(stolen, target_pts)  # Can't go negative
                 await self.cog.config.member(target_member).points.set(target_pts - stolen)
 
-            thief_pts = await self.cog.config.member(interaction.user).points()
-            await self.cog.config.member(interaction.user).points.set(thief_pts + stolen)
+            thief_conf = self.cog.config.member(interaction.user)
+            thief_pts = await thief_conf.points()
+            total_steals = await thief_conf.total_steals_success()
+            await thief_conf.points.set(thief_pts + stolen)
+            await thief_conf.total_steals_success.set(total_steals + 1)
 
             await interaction.response.send_message(
                 f"😈 Heist success! Stole {stolen} pts (total: {thief_pts + stolen})", ephemeral=True
@@ -217,6 +481,11 @@ class Reason(commands.Cog):
             "test_enabled": False,
             "test_channel_id": None,
             "best_reasons": [],  # [{"reason": str, "votes": int}, ...]
+            "channel_set_at": 0.0,  # timestamp when channel was configured
+            "first_drop_done": False,  # True after 6hr initial drop
+            "last_drop_at": 0.0,  # timestamp of last drop for 48hr interval
+            "guild_last_steal": 0.0,  # anti-spam: guild-wide steal cooldown
+            "drop_states": {},  # persistent view state: {msg_id: {...}}
         }
         self.config.register_guild(**default_guild)
         self.config.register_member(
@@ -225,6 +494,10 @@ class Reason(commands.Cog):
             points=0,
             streak=0,
             last_steal=0.0,
+            last_daily_claim=0.0,  # daily bonus tracking
+            total_claims=0,
+            total_steals_success=0,
+            total_ws=0,
         )
         
         reasons_path = Path(__file__).parent / "reasons.json"
@@ -237,6 +510,10 @@ class Reason(commands.Cog):
 
         self.reason_loop.start()
         self.reason_test_loop.start()
+
+    async def cog_load(self) -> None:
+        """Register persistent view so buttons work after bot restart."""
+        self.bot.add_view(PersistentReasonView(self))
 
     async def _intro_field_text_for(self, member: discord.Member) -> str:
         seen_intro = await self.config.member(member).seen_intro()
@@ -312,8 +589,24 @@ class Reason(commands.Cog):
         message_content = self._build_reason_message_content(member=member, reason_text=reason_text)
 
         try:
-            await channel.send(content=message_content, embed=embed, view=view)  # type: ignore[attr-defined]
+            msg = await channel.send(content=message_content, embed=embed, view=view)  # type: ignore[attr-defined]
+            view.message = msg  # for on_timeout editing
             await self.config.member(member).seen_intro.set(True)
+
+            # Save state for persistent view (survives bot restart)
+            async with self.config.guild(guild).drop_states() as states:
+                states[str(msg.id)] = {
+                    "target_user_id": member.id,
+                    "reason_text": reason_text,
+                    "rerolls_left": 2,
+                    "claimed": False,
+                    "rated": False,
+                }
+                # Cleanup: keep only last 100 entries
+                if len(states) > 100:
+                    sorted_keys = sorted(states.keys(), key=int)
+                    for k in sorted_keys[:-100]:
+                        del states[k]
         except discord.Forbidden:
             pass
         except Exception as e:
@@ -323,24 +616,47 @@ class Reason(commands.Cog):
         self.reason_loop.cancel()
         self.reason_test_loop.cancel()
 
-    @tasks.loop(hours=48)
+    @tasks.loop(minutes=30)
     async def reason_loop(self):
+        """Check every 30 mins; first drop 6hrs after channel set, then every 48hrs."""
+        now = time.time()
+        all_guilds = await self.config.all_guilds()
         for guild in self.bot.guilds:
+            gdata = all_guilds.get(guild.id, {})
             # If test mode is enabled, the 1-minute loop handles this guild.
-            if await self.config.guild(guild).test_enabled():
+            if gdata.get("test_enabled"):
                 continue
-            channel_id = await self.config.guild(guild).channel_id()
+            channel_id = gdata.get("channel_id")
             if not channel_id:
                 continue
 
-            await self._send_reason_drop(guild=guild, channel_id=channel_id, title="Reason")
+            gconf = self.config.guild(guild)
+            channel_set_at = gdata.get("channel_set_at", 0)
+            first_drop_done = gdata.get("first_drop_done", False)
+
+            if not first_drop_done:
+                # First drop: 6 hours after channel was set
+                if now - channel_set_at < 6 * 3600:
+                    continue  # not yet time
+                await self._send_reason_drop(guild=guild, channel_id=channel_id, title="Reason")
+                await gconf.first_drop_done.set(True)
+                await gconf.last_drop_at.set(now)
+            else:
+                # Subsequent drops: every 48 hours
+                last_drop = gdata.get("last_drop_at", 0)
+                if now - last_drop < 48 * 3600:
+                    continue
+                await self._send_reason_drop(guild=guild, channel_id=channel_id, title="Reason")
+                await gconf.last_drop_at.set(now)
 
     @tasks.loop(minutes=1)
     async def reason_test_loop(self):
+        all_guilds = await self.config.all_guilds()
         for guild in self.bot.guilds:
-            if not await self.config.guild(guild).test_enabled():
+            gdata = all_guilds.get(guild.id, {})
+            if not gdata.get("test_enabled"):
                 continue
-            channel_id = await self.config.guild(guild).test_channel_id()
+            channel_id = gdata.get("test_channel_id")
             if not channel_id:
                 continue
             await self._send_reason_drop(guild=guild, channel_id=channel_id, title="Reason (Test)")
@@ -386,8 +702,15 @@ class Reason(commands.Cog):
     @commands.guild_only()
     async def set_channel(self, ctx, channel: discord.TextChannel):
         """Set the channel where the embeds will be dropped."""
-        await self.config.guild(ctx.guild).channel_id.set(channel.id)
-        await ctx.send(f"Reason drops will now happen in {channel.mention}.")
+        now = time.time()
+        gconf = self.config.guild(ctx.guild)
+        await gconf.channel_id.set(channel.id)
+        await gconf.channel_set_at.set(now)
+        await gconf.first_drop_done.set(False)  # reset so 6hr timer starts fresh
+        await ctx.send(
+            f"Reason drops will now happen in {channel.mention}.\n"
+            f"First drop in ~6 hours, then every 48 hours."
+        )
 
     @reason.command(name="channelclear")
     @checks.admin_or_permissions(manage_guild=True)
@@ -487,11 +810,25 @@ class Reason(commands.Cog):
     @reason.command(name="stats")
     @commands.guild_only()
     async def reason_stats(self, ctx, member: discord.Member | None = None):
-        """View your (or another user's) points and streak."""
+        """View your (or another user's) points, streak, and achievements."""
         member = member or ctx.author
-        points = await self.config.member(member).points()
-        streak = await self.config.member(member).streak()
-        wallet_size = len(await self.config.member(member).wallet())
+        mconf = self.config.member(member)
+
+        # Batch read member stats
+        points = await mconf.points()
+        streak = await mconf.streak()
+        wallet = await mconf.wallet()
+        total_claims = await mconf.total_claims()
+        total_steals_success = await mconf.total_steals_success()
+        total_ws = await mconf.total_ws()
+
+        stats_dict = {
+            "points": points,
+            "streak": streak,
+            "total_claims": total_claims,
+            "total_steals_success": total_steals_success,
+            "total_ws": total_ws,
+        }
 
         embed = discord.Embed(
             title=f"📊 {member.display_name}'s Stats",
@@ -499,7 +836,19 @@ class Reason(commands.Cog):
         )
         embed.add_field(name="Points", value=str(points), inline=True)
         embed.add_field(name="🔥 Streak", value=str(streak), inline=True)
-        embed.add_field(name="🧾 Wallet", value=str(wallet_size), inline=True)
+        embed.add_field(name="🧾 Wallet", value=str(len(wallet)), inline=True)
+        embed.add_field(name="Claims", value=str(total_claims), inline=True)
+        embed.add_field(name="Steals", value=str(total_steals_success), inline=True)
+        embed.add_field(name="W Ratings", value=str(total_ws), inline=True)
+
+        # Achievements
+        unlocked = get_unlocked_achievements(stats_dict)
+        if unlocked:
+            ach_text = "\n".join(f"{a['name']} — *{a['desc']}*" for a in unlocked)
+        else:
+            ach_text = "None yet. Keep playing!"
+        embed.add_field(name="🏅 Achievements", value=ach_text, inline=False)
+
         await ctx.send(embed=embed)
 
     @reason.command(name="best")
